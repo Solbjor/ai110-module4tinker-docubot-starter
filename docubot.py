@@ -11,6 +11,9 @@ import os
 import glob
 import re
 
+# Minimum score threshold: a chunk must match at least this many query tokens to be returned
+MIN_SCORE_THRESHOLD = 2
+
 class DocuBot:
     def __init__(self, docs_folder="docs", llm_client=None):
         """
@@ -24,8 +27,13 @@ class DocuBot:
         self.documents = self.load_documents()  # List of (filename, text)
         self.document_map = dict(self.documents)
 
-        # Build a retrieval index (implemented in Phase 1)
-        self.index = self.build_index(self.documents)
+        # Split documents into chunks (paragraphs)
+        # self.chunks is a list of (filename, chunk_index, chunk_text) tuples
+        # self.chunk_index maps tokens to list of (chunk_list_index, filename, chunk_index) references
+        self.chunks = self._build_chunks()
+        
+        # Build a retrieval index at chunk granularity (Phase 1.5)
+        self.index = self.build_index()
 
     # -----------------------------------------------------------
     # Document Loading
@@ -47,6 +55,32 @@ class DocuBot:
         return docs
 
     # -----------------------------------------------------------
+    # Chunking
+    # -----------------------------------------------------------
+
+    def split_into_chunks(self, text):
+        """
+        Split document text into paragraphs (chunks) by double newline.
+        Returns a list of non-empty chunk strings.
+        """
+        paragraphs = text.split('\n\n')
+        # Strip whitespace and filter out empty paragraphs
+        chunks = [p.strip() for p in paragraphs if p.strip()]
+        return chunks
+
+    def _build_chunks(self):
+        """
+        Convert all documents into a flat list of chunks with metadata.
+        Returns list of (filename, chunk_index, chunk_text) tuples.
+        """
+        chunks = []
+        for filename, text in self.documents:
+            paragraphs = self.split_into_chunks(text)
+            for chunk_idx, chunk_text in enumerate(paragraphs):
+                chunks.append((filename, chunk_idx, chunk_text))
+        return chunks
+
+    # -----------------------------------------------------------
     # Index Construction (Phase 1)
     # -----------------------------------------------------------
 
@@ -56,32 +90,21 @@ class DocuBot:
         """
         return re.findall(r"\b\w+\b", text.lower())
 
-    def build_index(self, documents):
+    def build_index(self):
         """
-        TODO (Phase 1):
-        Build a tiny inverted index mapping lowercase words to the documents
-        they appear in.
-
-        Example structure:
-        {
-            "token": ["AUTH.md", "API_REFERENCE.md"],
-            "database": ["DATABASE.md"]
-        }
-
-        Keep this simple: split on whitespace, lowercase tokens,
-        ignore punctuation if needed.
+        Build an inverted index mapping tokens to chunks.
+        Maps each token to a list of (chunk_list_index, filename, chunk_text) tuples.
+        This is Phase 1.5: chunk-level indexing for more focused retrieval.
         """
         index = {}
 
-        for filename, text in documents:
-            tokens = set(self.tokenize(text))
+        for chunk_list_idx, (filename, chunk_idx, chunk_text) in enumerate(self.chunks):
+            tokens = set(self.tokenize(chunk_text))
             for token in tokens:
                 if token not in index:
-                    index[token] = set()
-                index[token].add(filename)
-
-        for token, filenames in index.items():
-            index[token] = sorted(filenames)
+                    index[token] = []
+                # Store reference to this chunk: (position in self.chunks, chunk_text, filename)
+                index[token].append((chunk_list_idx, chunk_text, filename))
 
         return index
 
@@ -113,28 +136,40 @@ class DocuBot:
 
     def retrieve(self, query, top_k=3):
         """
-        TODO (Phase 1):
-        Use the index and scoring function to select top_k relevant document snippets.
-
-        Return a list of (filename, text) sorted by score descending.
+        Phase 1.5: Chunk-based retrieval with score threshold.
+        
+        1. Find candidate chunks via index lookup
+        2. Score each chunk independently
+        3. Filter out chunks below MIN_SCORE_THRESHOLD (guardrail)
+        4. Sort by score descending
+        5. Return top_k chunks as (filename, chunk_text) tuples
         """
         query_tokens = self.tokenize(query)
         if not query_tokens:
             return []
 
-        candidate_filenames = set()
+        # Gather all candidate chunks from index
+        candidates_seen = set()
+        candidates = []
         for token in query_tokens:
-            candidate_filenames.update(self.index.get(token, []))
+            for chunk_list_idx, chunk_text, filename in self.index.get(token, []):
+                if chunk_list_idx not in candidates_seen:
+                    candidates_seen.add(chunk_list_idx)
+                    candidates.append((chunk_list_idx, chunk_text, filename))
 
+        # Score each chunk and apply threshold
         results = []
-        for filename in candidate_filenames:
-            text = self.document_map.get(filename, "")
-            score = self.score_document(query, text)
-            if score > 0:
-                results.append((score, filename, text))
+        for chunk_list_idx, chunk_text, filename in candidates:
+            score = self.score_document(query, chunk_text)
+            # Guardrail: only include chunks with meaningful evidence
+            if score >= MIN_SCORE_THRESHOLD:
+                results.append((score, filename, chunk_text))
 
+        # Sort by score descending, then by filename alphabetically
         results.sort(key=lambda item: (-item[0], item[1]))
-        return [(filename, text) for score, filename, text in results[:top_k]]
+        
+        # Return top_k chunks as (filename, chunk_text) tuples
+        return [(filename, chunk_text) for score, filename, chunk_text in results[:top_k]]
 
     # -----------------------------------------------------------
     # Answering Modes

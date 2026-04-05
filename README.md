@@ -1,5 +1,10 @@
 # Summary
 
+For this assignment we covered how to build a DocuBot and practice the AI reasoning. One thing in particular that students will need to understand is how to properly define what counts as evidence that a model interprets versus what is the actual evidence or context
+it needs to give you a reliable answer. There is a lot of back and forth trying to get this logic properly implemented in a way to make it so the AI doesn't just grab the first thing it sees as "evidence" and use that. That part is what I think students 
+may end up struggling with a lot, since there needs to be a clear and concise method for the AI to apply. Copilot is definitely helpful when it comes to planning out the approach and troubleshooting why the logic may be failing. However, students need to be wary 
+of copilot not understanding the logic for discerning evidence, since at the end of the day you should have the final say in what an AI should use as evidence when it comes to searching these files for information that is relevant to you as a developer.
+
 # DocuBot
 
 DocuBot is a small documentation assistant that helps answer developer questions about a codebase.  

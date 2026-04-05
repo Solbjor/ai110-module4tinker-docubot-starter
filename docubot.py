@@ -7,12 +7,30 @@ Core DocuBot class responsible for:
 - Supporting RAG answers when paired with Gemini (Phase 2)
 """
 
-import os
 import glob
+import os
 import re
 
 # Minimum score threshold: a chunk must match at least this many query tokens to be returned
 MIN_SCORE_THRESHOLD = 2
+
+# Simple stopword set for query-time filtering
+STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "how",
+    "i", "in", "is", "it", "of", "on", "or", "that", "the", "this", "to",
+    "was", "what", "when", "where", "which", "who", "why", "with"
+}
+
+# Tiny query expansion map to improve lexical recall for common variants.
+QUERY_SYNONYMS = {
+    "connect": ["connection", "database_url"],
+    "generated": ["generation", "created"],
+    "lists": ["list"],
+    "users": ["user"],
+    "endpoint": ["endpoints", "route"],
+    "api": ["/api"],
+}
+
 
 class DocuBot:
     def __init__(self, docs_folder="docs", llm_client=None):
@@ -29,10 +47,9 @@ class DocuBot:
 
         # Split documents into chunks (paragraphs)
         # self.chunks is a list of (filename, chunk_index, chunk_text) tuples
-        # self.chunk_index maps tokens to list of (chunk_list_index, filename, chunk_index) references
         self.chunks = self._build_chunks()
-        
-        # Build a retrieval index at chunk granularity (Phase 1.5)
+
+        # Build a retrieval index at chunk granularity
         self.index = self.build_index()
 
     # -----------------------------------------------------------
@@ -63,10 +80,8 @@ class DocuBot:
         Split document text into paragraphs (chunks) by double newline.
         Returns a list of non-empty chunk strings.
         """
-        paragraphs = text.split('\n\n')
-        # Strip whitespace and filter out empty paragraphs
-        chunks = [p.strip() for p in paragraphs if p.strip()]
-        return chunks
+        paragraphs = text.split("\n\n")
+        return [p.strip() for p in paragraphs if p.strip()]
 
     def _build_chunks(self):
         """
@@ -81,7 +96,7 @@ class DocuBot:
         return chunks
 
     # -----------------------------------------------------------
-    # Index Construction (Phase 1)
+    # Index Construction
     # -----------------------------------------------------------
 
     def tokenize(self, text):
@@ -90,65 +105,94 @@ class DocuBot:
         """
         return re.findall(r"\b\w+\b", text.lower())
 
+    def meaningful_query_tokens(self, query):
+        """
+        Return query tokens with common stopwords removed and lightweight expansion.
+        """
+        base_tokens = [token for token in self.tokenize(query) if token not in STOPWORDS]
+
+        expanded = []
+        seen = set()
+        for token in base_tokens:
+            if token not in seen:
+                expanded.append(token)
+                seen.add(token)
+
+            for alt in QUERY_SYNONYMS.get(token, []):
+                if alt not in seen:
+                    expanded.append(alt)
+                    seen.add(alt)
+
+        return expanded
+
     def build_index(self):
         """
         Build an inverted index mapping tokens to chunks.
-        Maps each token to a list of (chunk_list_index, filename, chunk_text) tuples.
-        This is Phase 1.5: chunk-level indexing for more focused retrieval.
+        Maps each token to a list of (chunk_list_index, chunk_text, filename) tuples.
         """
         index = {}
 
-        for chunk_list_idx, (filename, chunk_idx, chunk_text) in enumerate(self.chunks):
+        for chunk_list_idx, (filename, _, chunk_text) in enumerate(self.chunks):
             tokens = set(self.tokenize(chunk_text))
             for token in tokens:
                 if token not in index:
                     index[token] = []
-                # Store reference to this chunk: (position in self.chunks, chunk_text, filename)
                 index[token].append((chunk_list_idx, chunk_text, filename))
 
         return index
 
     # -----------------------------------------------------------
-    # Scoring and Retrieval (Phase 1)
+    # Scoring and Retrieval
     # -----------------------------------------------------------
+
+    def min_score_threshold(self, query_tokens):
+        """
+        Adaptive threshold:
+        - 1 for short/high-signal queries (single meaningful token)
+        - 2 otherwise
+        """
+        if len(query_tokens) <= 1:
+            return 1
+        return MIN_SCORE_THRESHOLD
 
     def score_document(self, query, text):
         """
-        TODO (Phase 1):
-        Return a simple relevance score for how well the text matches the query.
-
-        Suggested baseline:
-        - Convert query into lowercase words
-        - Count how many appear in the text
-        - Return the count as the score
+        Return a numeric relevance score for how well the chunk matches the query.
         """
-        query_tokens = self.tokenize(query)
+        query_tokens = self.meaningful_query_tokens(query)
         if not query_tokens:
             return 0
 
         text_tokens = set(self.tokenize(text))
-        score = 0
+        matched_tokens = 0
         for token in query_tokens:
             if token in text_tokens:
-                score += 1
+                matched_tokens += 1
 
-        return score
+        # Bonus when multiple query terms co-occur in one chunk.
+        bonus = 1 if matched_tokens >= 2 else 0
+
+        # Bonus for matched markdown heading chunks, which often summarize a section.
+        heading_bonus = 1 if text.strip().startswith("#") and matched_tokens >= 1 else 0
+
+        return matched_tokens + bonus + heading_bonus
 
     def retrieve(self, query, top_k=3):
         """
-        Phase 1.5: Chunk-based retrieval with score threshold.
-        
+        Chunk-based retrieval with adaptive score threshold.
+
         1. Find candidate chunks via index lookup
         2. Score each chunk independently
-        3. Filter out chunks below MIN_SCORE_THRESHOLD (guardrail)
+        3. Filter out chunks below threshold (guardrail)
         4. Sort by score descending
         5. Return top_k chunks as (filename, chunk_text) tuples
         """
-        query_tokens = self.tokenize(query)
+        query_tokens = self.meaningful_query_tokens(query)
         if not query_tokens:
             return []
 
-        # Gather all candidate chunks from index
+        threshold = self.min_score_threshold(query_tokens)
+
         candidates_seen = set()
         candidates = []
         for token in query_tokens:
@@ -157,18 +201,13 @@ class DocuBot:
                     candidates_seen.add(chunk_list_idx)
                     candidates.append((chunk_list_idx, chunk_text, filename))
 
-        # Score each chunk and apply threshold
         results = []
-        for chunk_list_idx, chunk_text, filename in candidates:
+        for _, chunk_text, filename in candidates:
             score = self.score_document(query, chunk_text)
-            # Guardrail: only include chunks with meaningful evidence
-            if score >= MIN_SCORE_THRESHOLD:
+            if score >= threshold:
                 results.append((score, filename, chunk_text))
 
-        # Sort by score descending, then by filename alphabetically
         results.sort(key=lambda item: (-item[0], item[1]))
-        
-        # Return top_k chunks as (filename, chunk_text) tuples
         return [(filename, chunk_text) for score, filename, chunk_text in results[:top_k]]
 
     # -----------------------------------------------------------
@@ -194,7 +233,7 @@ class DocuBot:
     def answer_rag(self, query, top_k=3):
         """
         Phase 2 RAG mode.
-        Uses student retrieval to select snippets, then asks Gemini
+        Uses retrieval to select snippets, then asks Gemini
         to generate an answer using only those snippets.
         """
         if self.llm_client is None:
